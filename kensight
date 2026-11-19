@@ -1,0 +1,97 @@
+#!/bin/sh
+# kensight: join this machine to a Kensight fleet with a code a person approves in Kensight.
+#
+#   kensight join <kensight address>
+#
+# It asks Kensight to join, shows a short code, and waits while someone signed in types that code into
+# Machines, Join Fleet. Once approved it collects a one-time join code and runs Kensight's install script
+# with it, so the code is never shown, copied or kept in shell history. It holds no Kensight address of its
+# own: Homebrew installs the same file for every Kensight.
+set -eu
+
+USAGE='usage: kensight join <kensight address>'
+die() { printf 'kensight: %s\n' "$*" >&2; exit 1; }
+
+[ "${1:-}" = join ] && [ -n "${2:-}" ] || { printf '%s\n' "$USAGE" >&2; exit 2; }
+URL=$2
+while [ "${URL%/}" != "$URL" ]; do URL=${URL%/}; done
+command -v curl >/dev/null 2>&1 || die "curl is needed."
+# The install refuses root too, but only after a person has approved the machine.
+[ "$(id -u)" != 0 ] || die "run this as yourself, not as root."
+
+# The name the machine asks to join as: its host name cleaned up as the worker does (setup.ts machineName).
+NAME=$(hostname | tr '[:upper:]' '[:lower:]' | sed -e 's/\.local$//' -e 's/[^a-z0-9-][^a-z0-9-]*/-/g' -e 's/^-*//' -e 's/-*$//' | cut -c1-63)
+case "$NAME" in [a-z0-9]*) ;; *) NAME=$(printf 'machine-%s' "$NAME" | cut -c1-63) ;; esac
+case "$(uname -s)" in
+  Darwin) OS=darwin ;;
+  Linux) OS=linux ;;
+  *) die "this system ($(uname -s)) is not supported; use a Mac or Linux." ;;
+esac
+case "$(uname -m)" in
+  arm64 | aarch64) ARCH=arm64 ;;
+  x86_64 | amd64) ARCH=x64 ;;
+  *) die "this CPU ($(uname -m)) is not supported." ;;
+esac
+
+# Posts JSON to Kensight and sets STATUS and REPLY. The body goes in on stdin, so the secret in it is not in
+# the process list.
+post() {
+  OUT=$(printf '%s' "$2" | curl -sS -m 20 -X POST -H 'content-type: application/json' --data-binary @- -w '\n%{http_code}' "$URL$1" 2>/dev/null || true)
+  STATUS=$(printf '%s\n' "$OUT" | tail -n 1)
+  REPLY=$(printf '%s\n' "$OUT" | sed '$d')
+}
+# A string or number field of REPLY, which Kensight sends as compact JSON.
+field() { printf '%s\n' "$REPLY" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
+number() { printf '%s\n' "$REPLY" | sed -n "s/.*\"$1\":\([0-9][0-9]*\).*/\1/p"; }
+unreachable() { die "Kensight cannot be reached at $URL"; }
+
+post /join/v1/device "{\"name\":\"$NAME\",\"os\":\"$OS\",\"arch\":\"$ARCH\"}"
+case "$STATUS" in
+  200) ;;
+  4??) die "$(field error)" ;;
+  *) unreachable ;;
+esac
+USER_CODE=$(field userCode)
+DEVICE_CODE=$(field deviceCode)
+LINK=$(field verificationUrl)
+INTERVAL=$(number interval)
+case "$INTERVAL" in '' | *[!0-9]*) INTERVAL=5 ;; esac
+[ -n "$USER_CODE" ] && [ -n "$DEVICE_CODE" ] || unreachable
+
+printf '\nYour code: %s\n' "$USER_CODE"
+printf 'Enter it in Kensight: %s\n\n' "${LINK:-Machines, Join Fleet}"
+if [ -n "$LINK" ] && [ "${KENSIGHT_NO_BROWSER:-}" != 1 ]; then
+  if [ "$OS" = darwin ]; then
+    open "$LINK" >/dev/null 2>&1 || true
+  elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$LINK" >/dev/null 2>&1 || true
+  fi
+fi
+printf 'Waiting for someone to approve it...\n'
+
+while :; do
+  sleep "$INTERVAL"
+  post /join/v1/device/poll "{\"deviceCode\":\"$DEVICE_CODE\"}"
+  case "$STATUS" in
+    200) ;;
+    403) die "$(field error)" ;;
+    *) unreachable ;;
+  esac
+  case "$(field status)" in
+    pending) ;;
+    approved) break ;;
+    *) unreachable ;;
+  esac
+done
+CODE=$(field code)
+[ -n "$CODE" ] || unreachable
+
+printf 'Approved. Installing the worker from Kensight.\n'
+TMP=$(mktemp -d)
+curl -fsSL "$URL/join/install.sh" -o "$TMP/install.sh" 2>/dev/null || { rm -rf "$TMP"; unreachable; }
+set +e
+sh "$TMP/install.sh" "$CODE"
+RESULT=$?
+set -e
+rm -rf "$TMP"
+exit "$RESULT"
